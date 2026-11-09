@@ -1,39 +1,74 @@
-# Prerequisites
+/docs
+/tests
+
+# Operating system files
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+Icon?
+.Spotlight-V100/
+.Trashes/
+
+# Windows
+Thumbs.db
+Thumbs.db:encryptable
+ehthumbs.db
+ehthumbs_vista.db
+Desktop.ini
+$RECYCLE.BIN/
+
+# Linux and Unix
+*~
+.#*
+*.swp
+*.swo
+*.swn
+.directory
+
+# Editor and IDE files
+.idea/
+.vs/
+*.suo
+*.user
+*.userosscache
+*.vcxproj.user
+*.code-workspace
+
+# C/C++ dependency files
 *.d
 
-# Compiled Object files
+# Compiled object files
 *.slo
 *.lo
 *.o
 *.obj
 
-# Precompiled Headers
+# Precompiled headers
 *.gch
 *.pch
-
-# Linker files
-*.ilk
-
-# Debugger Files
-*.pdb
-
-# Compiled Dynamic libraries
-*.so
-*.dylib
-*.dll
-*.so.*
 
 # Fortran module files
 *.mod
 *.smod
 
-# Compiled Static libraries
+# Linker and debugger files
+*.ilk
+*.pdb
+*.dwo
+*.dSYM/
+
+# Compiled libraries
+*.so
+*.so.*
+*.dylib
+*.dll
 *.lai
 *.la
 *.a
 *.lib
 
-# Executables
+# Executables and application bundles
 *.exe
 *.out
 *.app
@@ -42,6 +77,11 @@
 build/
 Build/
 build-*/
+out/
+Debug/
+Release/
+x64/
+x86/
 
 # CMake generated files
 CMakeFiles/
@@ -50,19 +90,20 @@ cmake_install.cmake
 Makefile
 install_manifest.txt
 compile_commands.json
+CMakeUserPresets.json
 
-# Temporary files
-*.tmp
-*.log
-*.bak
-*.swp
+# CMake and test output
+Testing/
+CTestTestfile.cmake
+.cache/
 
-# vcpkg
+# Package managers
 vcpkg_installed/
 
-# debug information files
-*.dwo
-
-# test output & cache
-Testing/
-.cache/
+# Logs and temporary files
+*.log
+*.tmp
+*.temp
+*.bak
+*.orig
+*.rej
