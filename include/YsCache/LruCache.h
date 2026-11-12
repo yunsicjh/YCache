@@ -9,34 +9,67 @@
 #include <unordered_map>
 #include <vector>
 namespace YsCache {
-
-// 前向声明
-template <typename Key, typename Value> class LruCache;
-template <typename Key, typename Value> class ShardedLruCache;
-template <typename Key, typename Value> class LruKCache;
-
-template <typename Key, typename Value> class LruNode {
-private:
-  std::optional<Key> key_;
-  std::optional<Value> value_;
-  std::shared_ptr<LruNode> next_;
-  std::weak_ptr<LruNode> prev_;
-
-public:
-  LruNode() = default;
-  LruNode(Key key, Value value)
-      : key_(std::move(key)), value_(std::move(value)) {}
-  friend class LruCache<Key, Value>;
+/**
+ * @brief 基础 LRU 节点结构体，支持双向链表操作
+ *
+ */
+struct LruNodeBase {
+  LruNodeBase *prev{nullptr};
+  LruNodeBase *next{nullptr};
+  /**
+   * @brief 把节点从链表剥离
+   *
+   *
+   */
+  void unlink() noexcept {
+    if (prev) {
+      prev->next = next;
+    }
+    if (next) {
+      next->prev = prev;
+    }
+    prev = nullptr;
+    next = nullptr;
+  }
+  /**
+   * @brief 把节点插入到指定节点之后
+   *
+   * @param target 指定节点指针
+   */
+  void insertAfter(LruNodeBase *target) noexcept {
+    next = target->next;
+    prev = target;
+    if (target->next) {
+      target->next->prev = this;
+    }
+    target->next = this;
+  }
 };
 
+/**
+ * @brief 数据节点
+ *
+ * @tparam Key
+ * @tparam Value
+ */
+template <typename Key, typename Value> struct LruNode : public LruNodeBase {
+  Key key;
+  Value value;
+  LruNode(Key k, Value v) : key(std::move(k)), value(std::move(v)) {}
+};
+
+/**
+ * @brief 基于 LRU 策略的缓存实现
+ *
+ * @tparam Key
+ * @tparam Value
+ */
 template <typename Key, typename Value>
 class LruCache : public YsCachePolicy<Key, Value> {
 public:
   using NodeType = LruNode<Key, Value>;
-  using NodePtr = std::shared_ptr<NodeType>;
+  using NodePtr = std::unique_ptr<NodeType>;
   using NodeMap = std::unordered_map<Key, NodePtr>;
-  friend class ShardedLruCache<Key, Value>;
-  friend class LruKCache<Key, Value>;
 
   explicit LruCache(std::size_t capacity) : capacity_(capacity) {
     initializeList();
@@ -48,338 +81,410 @@ public:
   LruCache(LruCache &&) = delete;
   LruCache &operator=(LruCache &&) = delete;
 
-  ~LruCache() override {
-    cacheMap_.clear();
-    NodePtr cur = dummyHead_;
-    while (cur) {
-      NodePtr next = cur->next_;
-      cur->next_ = nullptr;
-      cur->prev_.reset();
-      cur = next;
-    }
-    dummyHead_ = nullptr;
-    dummyTail_ = nullptr;
-  }
-
-  std::optional<Value> get(const Key &key) override {
-    std::lock_guard<std::mutex> lock(mutex_);
-    auto it = cacheMap_.find(key);
-    if (it == cacheMap_.end()) {
-      return std::nullopt;
-    }
-    moveToMostRecent(it->second);
-    return it->second->value_;
-  }
+  ~LruCache() override {}
 
   void put(Key key, Value value) override {
     if (capacity_ == 0) {
       return;
     }
-    std::lock_guard<std::mutex> lock(mutex_);
-    auto it = cacheMap_.find(key);
-    if (it != cacheMap_.end()) {
-      it->second->value_ = std::move(value);
-      moveToMostRecent(it->second);
-    } else {
-      if (cacheMap_.size() >= capacity_) {
-        evictLeastRecent();
-      }
-      NodePtr newNode = std::make_shared<NodeType>(key, std::move(value));
-      cacheMap_[std::move(key)] = newNode;
-      insertNode(newNode);
+    std::lock_guard lock(mutex_);
+    auto [it, inserted] = cacheMap_.emplace(std::move(key), nullptr);
+    if (!inserted) {
+      it->second->value = std::move(value);
+      moveToHead(it->second.get());
+      return;
+    }
+
+    try {
+      it->second = std::make_unique<NodeType>(it->first, std::move(value));
+    } catch (...) {
+      cacheMap_.erase(it);
+      throw;
+    }
+
+    it->second->insertAfter(&dummyHead_);
+
+    if (cacheMap_.size() > capacity_) {
+      evictLeastRecent();
     }
   }
 
-  bool remove(const Key &key) override {
-    std::lock_guard<std::mutex> lock(mutex_);
-    auto it = cacheMap_.find(key);
-    if (it != cacheMap_.end()) {
-      removeNode(it->second);
+  [[nodiscard]] std::optional<Value> get(const Key &key) override {
+    std::lock_guard lock(mutex_);
+    if (auto it = cacheMap_.find(key); it != cacheMap_.end()) {
+      moveToHead(it->second.get());
+      return it->second->value;
+    }
+    return std::nullopt;
+  }
+
+  [[nodiscard]] virtual bool remove(const Key &key) override {
+    std::lock_guard lock(mutex_);
+    if (auto it = cacheMap_.find(key); it != cacheMap_.end()) {
+      it->second->unlink();
       cacheMap_.erase(it);
       return true;
     }
     return false;
   }
+  [[nodiscard]] virtual bool contains(const Key &key) const override {
+    std::lock_guard lock(mutex_);
+    return cacheMap_.find(key) != cacheMap_.end();
+  }
 
-  // 辅助只读接口
-  std::size_t size() const {
-    std::lock_guard<std::mutex> lock(mutex_);
+  [[nodiscard]] virtual std::size_t size() const override {
+    std::lock_guard lock(mutex_);
     return cacheMap_.size();
   }
+  [[nodiscard]] virtual std::size_t capacity() const noexcept override {
+    return capacity_;
+  }
+  [[nodiscard]] virtual bool empty() const override {
 
-  std::size_t capacity() const noexcept { return capacity_; }
-
-  bool empty() const {
-    std::lock_guard<std::mutex> lock(mutex_);
-    return emptyUnlock();
+    std::lock_guard lock(mutex_);
+    return cacheMap_.empty();
   }
 
-  void clear() {
-    std::lock_guard<std::mutex> lock(mutex_);
-    clearUnlock();
+  virtual void clear() override {
+    std::lock_guard lock(mutex_);
+    cacheMap_.clear();
+    initializeList();
   }
 
 private:
+  void initializeList() noexcept {
+    dummyHead_.next = &dummyTail_;
+    dummyTail_.prev = &dummyHead_;
+    dummyHead_.prev = nullptr;
+    dummyTail_.next = nullptr;
+  }
+
+  void moveToHead(NodeType *node) noexcept {
+    node->unlink();
+    node->insertAfter(&dummyHead_);
+  }
+
+  void evictLeastRecent() noexcept {
+    if (dummyTail_.prev == &dummyHead_) {
+      return;
+    }
+    auto *victim = static_cast<NodeType *>(dummyTail_.prev);
+    victim->unlink();
+    cacheMap_.erase(victim->key);
+  }
   std::size_t capacity_;
-  NodeMap cacheMap_;
-  NodePtr dummyHead_;
-  NodePtr dummyTail_;
   mutable std::mutex mutex_;
-
-  void initializeList() {
-    dummyHead_ = std::make_shared<NodeType>();
-    dummyTail_ = std::make_shared<NodeType>();
-    dummyHead_->next_ = dummyTail_;
-    dummyTail_->prev_ = dummyHead_;
-  }
-
-  void removeNode(NodePtr node) {
-    auto prevNode = node->prev_.lock();
-    if (prevNode && node->next_) {
-      prevNode->next_ = node->next_;
-      node->next_->prev_ = prevNode;
-      node->next_ = nullptr;
-      node->prev_.reset();
-    }
-  }
-
-  void insertNode(NodePtr node) {
-    auto prevNode = dummyTail_->prev_.lock();
-    if (!prevNode) {
-      return;
-    }
-    node->next_ = dummyTail_;
-    prevNode->next_ = node;
-    node->prev_ = prevNode;
-    dummyTail_->prev_ = node;
-  }
-
-  void evictLeastRecent() {
-    if (cacheMap_.empty()) {
-      return;
-    }
-    NodePtr evictNode = dummyHead_->next_;
-    if (evictNode && evictNode != dummyTail_ && evictNode->key_.has_value()) {
-      removeNode(evictNode);
-      cacheMap_.erase(evictNode->key_.value());
-    }
-  }
-
-  void moveToMostRecent(NodePtr node) {
-    if (node->next_ == dummyTail_) {
-      return;
-    }
-    removeNode(node);
-    insertNode(node);
-  }
-
-  void clearUnlock() {
-    cacheMap_.clear();
-    NodePtr cur = dummyHead_->next_;
-    while (cur && cur != dummyTail_) {
-      NodePtr next = cur->next_;
-      cur->next_ = nullptr;
-      cur->prev_.reset();
-      cur = next;
-    }
-    dummyHead_->next_ = dummyTail_;
-    dummyTail_->prev_ = dummyHead_;
-  }
-
-  bool emptyUnlock() const { return cacheMap_.empty(); }
+  NodeMap cacheMap_;
+  LruNodeBase dummyHead_;
+  LruNodeBase dummyTail_;
 };
 
-template <typename Key, typename Value>
-class ShardedLruCache : public YsCachePolicy<Key, Value> {
-public:
-  ShardedLruCache(int capacity, size_t shardCount)
-      : capacity_(capacity),
-        shardCount_(shardCount > 0 ? shardCount
-                                   : std::thread::hardware_concurrency()) {
-    size_t count = 1;
-    while (count < shardCount_) {
-      count = count << 1;
-    }
-    shardCount_ = count;
-    auto shardCapacity =
-        std::ceil(static_cast<double>(capacity_) / shardCount_);
-    for (auto i = 0; i < shardCount_; ++i) {
-      shards_.emplace_back(
-          std::make_unique<LruCache<Key, Value>>(shardCapacity));
-    }
-  }
+constexpr std::size_t KCacheLineSize = 64; // 缓存行大小
 
-  std::optional<Value> get(const Key &key) override {
-    auto &shard = getShard(key);
-    return shard.get(key);
+template <typename Key, typename Value, typename Hash = std::hash<Key>>
+
+class ShardedLruCache : public YsCachePolicy<Key, Value> {
+private:
+  struct alignas(KCacheLineSize) AlignedShard {
+    LruCache<Key, Value> cache;
+    AlignedShard(std::size_t capacity) : cache(capacity) {}
+  };
+
+public:
+  explicit ShardedLruCache(std::size_t capacity, std::size_t shardCount = 0)
+      : capacity_(capacity),
+        shardCount_(roundUpToPowerOfTwo(
+            shardCount > 0 ? shardCount
+                           : std::thread::hardware_concurrency())) {
+    std::size_t shardCapacity = (capacity_ + shardCount_ - 1) / shardCount_;
+    shards_.reserve(shardCount_);
+    for (std::size_t i = 0; i < shardCount_; ++i) {
+      shards_.emplace_back(std::make_unique<AlignedShard>(shardCapacity));
+    }
   }
 
   void put(Key key, Value value) override {
-    auto &shard = getShard(key);
-    shard.put(std::move(key), std::move(value));
+    getShard(key).put(std::move(key), std::move(value));
   }
 
-  bool remove(const Key &key) override {
-    auto &shard = getShard(key);
-    return shard.remove(key);
+  [[nodiscard]] std::optional<Value> get(const Key &key) override {
+    return getShard(key).get(key);
   }
 
-  void clear() {
-    std::vector<std::unique_lock<std::mutex>> locks;
-    locks.reserve(shardCount_);
-    for (auto i = 0; i < shardCount_; ++i) {
-      locks.emplace_back(shards_[i]->mutex_);
-      shards_[i]->clearUnlock();
-    }
+  [[nodiscard]] bool remove(const Key &key) override {
+    return getShard(key).remove(key);
   }
 
-  std::size_t size() const {
-    std::size_t totalSize = 0;
+  [[nodiscard]] bool contains(const Key &key) const override {
+    return getShard(key).contains(key);
+  }
+
+  [[nodiscard]] std::size_t size() const override {
+    std::size_t total = 0;
     for (const auto &shard : shards_) {
-      totalSize += shard->size();
+      total += shard->cache.size();
     }
-    return totalSize;
+    return total;
   }
 
-  std::size_t capacity() const {
-    std::size_t totalCapacity = 0;
-    for (const auto &shard : shards_) {
-      totalCapacity += shard->capacity();
-    }
-    return totalCapacity;
+  [[nodiscard]] std::size_t capacity() const noexcept override {
+    return capacity_;
   }
 
-  bool empty() const {
-    std::vector<std::unique_lock<std::mutex>> locks;
-    locks.reserve(shardCount_);
+  [[nodiscard]] bool empty() const override {
     for (const auto &shard : shards_) {
-      locks.emplace_back(shard->mutex_);
-      if (!shard->emptyUnlock()) {
+      if (!shard->cache.empty()) {
         return false;
       }
     }
     return true;
   }
 
+  void clear() override {
+    for (auto &shard : shards_) {
+      shard->cache.clear();
+    }
+  }
+
 private:
-  /*TODO：
-  #include <new>
+  static std::size_t roundUpToPowerOfTwo(std::size_t n) noexcept {
+    if (n <= 1) {
+      return 1;
+    }
 
-  struct alignas(std::hardware_destructive_interference_size) AlignedShard {
-      LruCache<Key, Value> cache;
-  };
-
-  // 分片数组紧凑存放时，每个元素都会独占至少一个缓存行
-  std::vector<AlignedShard> shards_;
-   */
-  int capacity_;
-  size_t shardCount_;
-  std::vector<std::unique_ptr<LruCache<Key, Value>>> shards_;
+    std::size_t p = 1;
+    while (p < n) {
+      p <<= 1;
+    }
+    return p;
+  }
 
   LruCache<Key, Value> &getShard(const Key &key) {
-    auto hashValue = std::hash<Key>{}(key);
-    auto index = hashValue & (shardCount_ - 1);
-    return *shards_[index];
+    std::size_t index = hashFunc_(key) & (shardCount_ - 1);
+    return shards_[index]->cache;
   }
+
+  const LruCache<Key, Value> &getShard(const Key &key) const {
+    std::size_t index = hashFunc_(key) & (shardCount_ - 1);
+    return shards_[index]->cache;
+  }
+
+  std::size_t capacity_;
+  std::size_t shardCount_;
+  Hash hashFunc_{};
+  std::vector<std::unique_ptr<AlignedShard>> shards_;
 };
 
 template <typename Key, typename Value>
 class LruKCache : public YsCachePolicy<Key, Value> {
 private:
-  struct HistoryEntry {
-    std::size_t accessCount_{1};
-    Value value_;
+  struct LruKNode : public LruNodeBase {
+    Key key;
+    Value value;
+    std::size_t accessCount{1};
+    bool isInMain{false};
+    LruKNode(Key k, Value v, std::size_t count = 1)
+        : key(std::move(k)), value(std::move(v)), accessCount(count) {}
   };
-  using MainCache = LruCache<Key, Value>;
-  using HistoryCache = LruCache<Key, HistoryEntry>;
+
+  using NodePtr = std::unique_ptr<LruKNode>;
+  using NodeMap = std::unordered_map<Key, NodePtr>;
 
 public:
-  LruKCache(std::size_t capacity, std::size_t historyCapacity,
-            std::size_t k = 2)
-      : k_(k), kCache_(std::make_unique<MainCache>(capacity)),
-        historyList_(std::make_unique<HistoryCache>(historyCapacity)) {}
+  explicit LruKCache(std::size_t capacity, std::size_t historyCapacity,
+                     std::size_t k = 2)
+      : k_(k), kCapacity_(capacity), historyCapacity_(historyCapacity) {
+    initializeLists();
+  }
 
-  std::optional<Value> get(const Key &key) override {
-    std::lock_guard<std::mutex> lock(mutex_);
-    auto kCacheValue = kCache_->get(key);
-    if (kCacheValue.has_value()) {
-      return kCacheValue;
-    }
+  // 禁用拷贝与移动
+  LruKCache(const LruKCache &) = delete;
+  LruKCache &operator=(const LruKCache &) = delete;
+  LruKCache(LruKCache &&) = delete;
+  LruKCache &operator=(LruKCache &&) = delete;
+  ~LruKCache() override = default;
 
-    auto hisOpt = historyList_->get(key);
-    if (hisOpt.has_value()) {
-      auto hisEntry = std::move(hisOpt.value());
-      hisEntry.accessCount_ += 1;
-      Value val = hisEntry.value_;
-      if (hisEntry.accessCount_ >= k_) {
-        historyList_->remove(key);
-        kCache_->put(key, std::move(hisEntry.value_));
+  [[nodiscard]] std::optional<Value> get(const Key &key) override {
+    std::lock_guard lock(mutex_);
+    if (auto it = cacheMap_.find(key); it != cacheMap_.end()) {
+      LruKNode *node = it->second.get();
+      node->accessCount++;
 
+      if (node->isInMain) {
+        node->unlink();
+        node->insertAfter(&mainHead_);
       } else {
-        historyList_->put(key, std::move(hisEntry));
+        if (node->accessCount >= k_) {
+          node->unlink();
+          historySize_--;
+
+          if (mainSize_ >= kCapacity_) {
+            evictFromMain();
+          }
+
+          node->isInMain = true;
+          node->insertAfter(&mainHead_);
+          mainSize_++;
+        } else {
+          node->unlink();
+          node->insertAfter(&historyHead_);
+        }
       }
-      return val;
+      return node->value;
     }
     return std::nullopt;
   }
 
   void put(Key key, Value value) override {
-    std::lock_guard<std::mutex> lock(mutex_);
-    if (kCache_->get(key).has_value()) {
-      kCache_->put(std::move(key), std::move(value));
+    if (kCapacity_ == 0 && historyCapacity_ == 0) {
       return;
     }
-    auto hisOpt = historyList_->get(key);
-    if (hisOpt.has_value()) {
-      auto hisEntry = std::move(hisOpt.value());
-      hisEntry.accessCount_ += 1;
+    std::lock_guard lock(mutex_);
 
-      if (hisEntry.accessCount_ >= k_) {
-        historyList_->remove(key);
-        kCache_->put(std::move(key), std::move(value));
-        return;
+    auto [it, inserted] = cacheMap_.try_emplace(std::move(key), nullptr);
+    if (!inserted) {
+      LruKNode *node = it->second.get();
+      node->value = std::move(value);
+      node->accessCount++;
+
+      if (node->isInMain) {
+        node->unlink();
+        node->insertAfter(&mainHead_);
       } else {
-        hisEntry.value_ = std::move(value);
-        historyList_->put(std::move(key), std::move(hisEntry));
-        return;
+        if (node->accessCount >= k_) {
+          node->unlink();
+          historySize_--;
+
+          if (mainSize_ >= kCapacity_) {
+            evictFromMain();
+          }
+
+          node->isInMain = true;
+          node->insertAfter(&mainHead_);
+          mainSize_++;
+        } else {
+          node->unlink();
+          node->insertAfter(&historyHead_);
+        }
       }
+      return;
     }
 
+    try {
+      it->second = std::make_unique<LruKNode>(it->first, std::move(value), 1);
+    } catch (...) {
+      cacheMap_.erase(it);
+      throw;
+    }
+
+    LruKNode *node = it->second.get();
     if (k_ <= 1) {
-      kCache_->put(std::move(key), std::move(value));
+      if (mainSize_ >= kCapacity_) {
+        evictFromMain();
+      }
+      node->isInMain = true;
+      node->insertAfter(&mainHead_);
+      mainSize_++;
     } else {
-      historyList_->put(std::move(key), HistoryEntry{1, std::move(value)});
+      if (historySize_ >= historyCapacity_) {
+        evictFromHistory();
+      }
+      node->isInMain = false;
+      node->insertAfter(&historyHead_);
+      historySize_++;
     }
   }
 
-  bool remove(const Key &key) override {
-    std::lock_guard<std::mutex> lock(mutex_);
-    bool removedFromKCache = kCache_->remove(key);
-    bool removedFromHistory = historyList_->remove(key);
-    return removedFromKCache || removedFromHistory;
+  [[nodiscard]] bool remove(const Key &key) override {
+    std::lock_guard lock(mutex_);
+    if (auto it = cacheMap_.find(key); it != cacheMap_.end()) {
+      LruKNode *node = it->second.get();
+      node->unlink();
+      if (node->isInMain) {
+        mainSize_--;
+      } else {
+        historySize_--;
+      }
+      cacheMap_.erase(it);
+      return true;
+    }
+    return false;
   }
 
-  void clear() {
-    std::lock_guard<std::mutex> lock(mutex_);
-    kCache_->clear();
-    historyList_->clear();
+  [[nodiscard]] bool contains(const Key &key) const override {
+    std::lock_guard lock(mutex_);
+    return cacheMap_.find(key) != cacheMap_.end();
   }
 
-  std::size_t size() const {
-    std::lock_guard<std::mutex> lock(mutex_);
-    return kCache_->size() + historyList_->size();
+  [[nodiscard]] std::size_t size() const override {
+    std::lock_guard lock(mutex_);
+    return mainSize_ + historySize_;
   }
 
-  bool empty() const {
-    std::lock_guard<std::mutex> lock(mutex_);
-    return kCache_->empty() && historyList_->empty();
+  [[nodiscard]] std::size_t capacity() const noexcept override {
+    return kCapacity_;
+  }
+
+  [[nodiscard]] bool empty() const override {
+    std::lock_guard lock(mutex_);
+    return cacheMap_.empty();
+  }
+
+  void clear() override {
+    std::lock_guard lock(mutex_);
+    cacheMap_.clear();
+    mainSize_ = 0;
+    historySize_ = 0;
+    initializeLists();
   }
 
 private:
+  void initializeLists() noexcept {
+    mainHead_.next = &mainTail_;
+    mainTail_.prev = &mainHead_;
+    mainHead_.prev = nullptr;
+    mainTail_.next = nullptr;
+
+    historyHead_.next = &historyTail_;
+    historyTail_.prev = &historyHead_;
+    historyHead_.prev = nullptr;
+    historyTail_.next = nullptr;
+  }
+
+  void evictFromMain() noexcept {
+    if (mainTail_.prev == &mainHead_) {
+      return;
+    }
+
+    auto *victim = static_cast<LruKNode *>(mainTail_.prev);
+    victim->unlink();
+    mainSize_--;
+    cacheMap_.erase(victim->key);
+  }
+
+  void evictFromHistory() noexcept {
+    if (historyTail_.prev == &historyHead_) {
+      return;
+    }
+
+    auto *victim = static_cast<LruKNode *>(historyTail_.prev);
+    victim->unlink();
+    historySize_--;
+    cacheMap_.erase(victim->key);
+  }
   std::size_t k_;
-  std::unique_ptr<MainCache> kCache_;
-  std::unique_ptr<HistoryCache> historyList_;
+  std::size_t kCapacity_;
+  std::size_t historyCapacity_;
+  std::size_t mainSize_{0};
+  std::size_t historySize_{0};
+
   mutable std::mutex mutex_;
+  NodeMap cacheMap_;
+
+  LruNodeBase mainHead_{};
+  LruNodeBase mainTail_{};
+  LruNodeBase historyHead_{};
+  LruNodeBase historyTail_{};
 };
 
 } // namespace YsCache

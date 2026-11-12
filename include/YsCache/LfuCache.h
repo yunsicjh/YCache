@@ -1,375 +1,347 @@
 #pragma once
 #include "YsCachePolicy.h"
-#include <climits>
 #include <cmath>
+#include <cstddef>
 #include <memory>
 #include <mutex>
 #include <optional>
 #include <thread>
 #include <unordered_map>
 #include <vector>
-
 namespace YsCache {
+struct LfuNodeBase {
+  LfuNodeBase *prev{nullptr};
+  LfuNodeBase *next{nullptr};
 
-template <typename Key, typename Value> class LfuCache;
+  void unlink() noexcept {
+    if (prev) {
+      prev->next = next;
+    }
+    if (next) {
+      next->prev = prev;
+    }
+    prev = nullptr;
+    next = nullptr;
+  }
+
+  void insertAfter(LfuNodeBase *target) noexcept {
+    next = target->next;
+    prev = target;
+    if (target->next) {
+      target->next->prev = this;
+    }
+    target->next = this;
+  }
+};
+
+template <typename Key, typename Value> struct LfuNode : public LfuNodeBase {
+  Key key;
+  Value value;
+  std::size_t freq{1};
+
+  LfuNode(Key k, Value v, std::size_t f = 1) noexcept(
+      std::is_nothrow_move_constructible_v<Key> &&
+      std::is_nothrow_move_constructible_v<Value>)
+      : key(std::move(k)), value(std::move(v)), freq(f) {}
+};
 
 template <typename Key, typename Value> class FreqList {
-private:
-  struct LfuNode {
-    int freq{1};
-    std::optional<Key> key;
-    std::optional<Value> value;
-    std::weak_ptr<LfuNode> prev;
-    std::shared_ptr<LfuNode> next;
-
-    LfuNode() = default;
-    LfuNode(int f, Key k, Value v)
-        : freq(f), key(std::move(k)), value(std::move(v)) {}
-  };
-
 public:
-  using NodeType = LfuNode;
-  using NodePtr = std::shared_ptr<NodeType>;
-  friend class LfuCache<Key, Value>;
+  using NodeType = LfuNode<Key, Value>;
 
-  FreqList() { initializeList(); }
+  FreqList() noexcept {
+    dummyHead_.next = &dummyTail_;
+    dummyTail_.prev = &dummyHead_;
+    dummyHead_.prev = nullptr;
+    dummyTail_.next = nullptr;
+  }
+  FreqList(const FreqList &) = delete;
+  FreqList &operator=(const FreqList &) = delete;
 
-  ~FreqList() {
-    // 迭代断开链表，防止深层递归析构导致栈溢出
-    NodePtr cur = dummyHead_;
-    while (cur) {
-      NodePtr next = cur->next;
-      cur->next = nullptr;
-      cur->prev.reset();
-      cur = next;
+  [[nodiscard]] bool empty() const noexcept {
+    return dummyHead_.next == &dummyTail_;
+  }
+
+  void pushFront(NodeType *node) noexcept { node->insertAfter(&dummyHead_); }
+  NodeType *popTail() noexcept {
+    if (empty()) {
+      return nullptr;
     }
-    dummyHead_ = nullptr;
-    dummyTail_ = nullptr;
+    auto *tailNode = static_cast<NodeType *>(dummyTail_.prev);
+    tailNode->unlink();
+    return tailNode;
   }
-
-  void removeNode(NodePtr node) {
-    auto prevNode = node->prev.lock();
-    if (prevNode && node->next) {
-      prevNode->next = node->next;
-      node->next->prev = prevNode;
-      node->prev.reset();
-      node->next = nullptr;
-    }
-  }
-
-  NodePtr popTail() {
-    auto resNode = dummyTail_->prev.lock();
-    if (resNode && resNode != dummyHead_) {
-      removeNode(resNode);
-      return resNode;
-    }
-    return nullptr;
-  }
-
-  void pushFront(NodePtr node) {
-    node->next = dummyHead_->next;
-    dummyHead_->next = node;
-    node->next->prev = node;
-    node->prev = dummyHead_;
-  }
-
-  bool empty() const { return dummyHead_->next == dummyTail_; }
 
 private:
-  NodePtr dummyHead_;
-  NodePtr dummyTail_;
-
-  void initializeList() {
-    dummyHead_ = std::make_shared<NodeType>();
-    dummyTail_ = std::make_shared<NodeType>();
-    dummyHead_->next = dummyTail_;
-    dummyTail_->prev = dummyHead_;
-  }
+  LfuNodeBase dummyHead_{};
+  LfuNodeBase dummyTail_{};
 };
 
 template <typename Key, typename Value>
 class LfuCache : public YsCachePolicy<Key, Value> {
-public:
-  using NodeType = typename FreqList<Key, Value>::NodeType;
-  using NodePtr = typename FreqList<Key, Value>::NodePtr;
-  using FreqListPtr = std::unique_ptr<FreqList<Key, Value>>;
 
-  explicit LfuCache(size_t capacity, size_t maxAvgFreq = 10)
+public:
+  using NodeType = LfuNode<Key, Value>;
+  using NodePtr = std::unique_ptr<NodeType>;
+  using FreqListType = FreqList<Key, Value>;
+  using FreqListPtr = std::unique_ptr<FreqListType>;
+
+  explicit LfuCache(std::size_t capacity, std::size_t maxAvgFreq = 10)
       : capacity_(capacity), maxAvgFreq_(maxAvgFreq) {}
 
   LfuCache(const LfuCache &) = delete;
   LfuCache &operator=(const LfuCache &) = delete;
   LfuCache(LfuCache &&) = delete;
   LfuCache &operator=(LfuCache &&) = delete;
-
-  ~LfuCache() override { clear(); }
+  ~LfuCache() override = default;
 
   void put(Key key, Value value) override {
-    std::lock_guard<std::mutex> lock(mutex_);
     if (capacity_ == 0) {
       return;
     }
-    auto it = keyMap_.find(key);
-    if (it != keyMap_.end()) {
-      auto nodePtr = it->second;
-      nodePtr->value = std::move(value);
-      updateFreq(nodePtr);
+
+    std::lock_guard lock(mutex_);
+
+    auto [it, inserted] = keyMap_.try_emplace(std::move(key), nullptr);
+    if (!inserted) {
+      it->second->value = std::move(value);
+      updateFreq(it->second.get());
       return;
     }
 
-    if (size_ >= capacity_) {
-      auto itFreq = freqMap_.find(minFreq_);
-      if (itFreq != freqMap_.end()) {
-        auto nodeToRemove = itFreq->second->popTail();
-        if (nodeToRemove) {
-          keyMap_.erase(nodeToRemove->key.value());
-          curTotalFreq_ -= nodeToRemove->freq;
-          size_--;
-          if (itFreq->second->empty()) {
-            freqMap_.erase(itFreq);
-          }
-        }
-      }
+    if (keyMap_.size() > capacity_) {
+      evictMinFreq();
     }
-    NodePtr newNode =
-        std::make_shared<NodeType>(1, std::move(key), std::move(value));
+
+    try {
+      it->second = std::make_unique<NodeType>(it->first, std::move(value), 1);
+    } catch (...) {
+      keyMap_.erase(it);
+      throw;
+    }
 
     minFreq_ = 1;
-    auto &freqList = freqMap_[minFreq_];
-    if (!freqList) {
-      freqList = std::make_unique<FreqList<Key, Value>>();
+    auto &list = freqMap_[minFreq_];
+    if (!list) {
+      list = std::make_unique<FreqListType>();
     }
-    freqList->pushFront(newNode);
-    curTotalFreq_ += 1;
-    keyMap_[newNode->key.value()] = newNode;
-    size_++;
+    list->pushFront(it->second.get());
+    curTotalFreq_++;
+
+    if (maxAvgFreq_ > 0 && curTotalFreq_ > maxAvgFreq_ * keyMap_.size()) {
+      handleOverMaxAvgFreq();
+    }
   }
 
-  std::optional<Value> get(const Key &key) override {
-    std::lock_guard<std::mutex> lock(mutex_);
-    auto it = keyMap_.find(key);
-    if (it == keyMap_.end()) {
-      return std::nullopt;
+  [[nodiscard]] std::optional<Value> get(const Key &key) override {
+    std::lock_guard lock(mutex_);
+    if (auto it = keyMap_.find(key); it != keyMap_.end()) {
+      updateFreq(it->second.get());
+      return it->second->value;
     }
-    auto node = it->second;
-    updateFreq(node);
-    return node->value;
+    return std::nullopt;
   }
 
-  bool remove(const Key &key) override {
-    std::lock_guard<std::mutex> lock(mutex_);
-    auto it = keyMap_.find(key);
-    if (it == keyMap_.end()) {
-      return false;
-    }
-
-    auto node = it->second;
-    int freq = node->freq;
-    auto itFreq = freqMap_.find(freq);
-    if (itFreq != freqMap_.end()) {
-      itFreq->second->removeNode(node);
-      curTotalFreq_ -= freq;
-      keyMap_.erase(it);
-      size_--;
-
-      if (itFreq->second->empty()) {
+  [[nodiscard]] bool remove(const Key &key) override {
+    std::lock_guard lock(mutex_);
+    if (auto it = keyMap_.find(key); it != keyMap_.end()) {
+      NodeType *node = it->second.get();
+      std::size_t f = node->freq;
+      node->unlink();
+      curTotalFreq_ -= f;
+      // 检查频次桶是否空了
+      if (auto itFreq = freqMap_.find(f);
+          itFreq != freqMap_.end() && itFreq->second->empty()) {
         freqMap_.erase(itFreq);
-
-        if (size_ == 0) {
-          minFreq_ = 0;
-        } else if (freq == minFreq_) {
-          int minVal = INT_MAX;
-          for (const auto &pair : freqMap_) {
-            minVal = std::min(minVal, pair.first);
-          }
-          minFreq_ = minVal;
-        }
       }
+      keyMap_.erase(it);
       return true;
     }
     return false;
   }
 
-  void clear() {
-    std::lock_guard<std::mutex> lock(mutex_);
+  [[nodiscard]] bool contains(const Key &key) const override {
+    std::lock_guard lock(mutex_);
+    return keyMap_.find(key) != keyMap_.end();
+  }
+  [[nodiscard]] std::size_t size() const override {
+    std::lock_guard lock(mutex_);
+    return keyMap_.size();
+  }
+  [[nodiscard]] std::size_t capacity() const noexcept override {
+    return capacity_;
+  }
+  [[nodiscard]] bool empty() const override {
+    std::lock_guard lock(mutex_);
+    return keyMap_.empty();
+  }
+  void clear() override {
+    std::lock_guard lock(mutex_);
     keyMap_.clear();
     freqMap_.clear();
-    size_ = 0;
-    curTotalFreq_ = 0;
     minFreq_ = 0;
-  }
-
-  void purge() { clear(); }
-
-  size_t size() const {
-    std::lock_guard<std::mutex> lock(mutex_);
-    return size_;
-  }
-
-  size_t capacity() const noexcept { return capacity_; }
-
-  bool empty() const {
-    std::lock_guard<std::mutex> lock(mutex_);
-    return size_ == 0;
+    curTotalFreq_ = 0;
   }
 
 private:
-  void updateFreq(NodePtr node) {
-    int oldFreq = node->freq;
-    int newFreq = oldFreq + 1;
+  void updateFreq(NodeType *node) noexcept {
+    std::size_t oldFreq = node->freq;
+    std::size_t newFreq = oldFreq + 1;
     node->freq = newFreq;
 
-    auto itOld = freqMap_.find(oldFreq);
-    if (itOld != freqMap_.end()) {
-      itOld->second->removeNode(node);
-      if (itOld->second->empty()) {
-        freqMap_.erase(itOld);
-        if (minFreq_ == oldFreq) {
-          minFreq_++;
-        }
+    node->unlink();
+    if (auto itOld = freqMap_.find(oldFreq);
+        itOld != freqMap_.end() && itOld->second->empty()) {
+      freqMap_.erase(itOld);
+      if (minFreq_ == oldFreq) {
+        minFreq_ = newFreq;
       }
     }
 
     auto &newList = freqMap_[newFreq];
     if (!newList) {
-      newList = std::make_unique<FreqList<Key, Value>>();
+      newList = std::make_unique<FreqListType>();
     }
-    newList->pushFront(node);
-    curTotalFreq_ += 1;
 
-    // 完成新桶挂载后再检测老化衰减，防止空指针异常
-    if (maxAvgFreq_ > 0 && curTotalFreq_ > maxAvgFreq_ * size_) {
+    newList->pushFront(node);
+    curTotalFreq_++;
+
+    if (maxAvgFreq_ > 0 && curTotalFreq_ > maxAvgFreq_ * keyMap_.size()) {
       handleOverMaxAvgFreq();
     }
   }
 
-  void handleOverMaxAvgFreq() {
+  void evictMinFreq() noexcept {
+    auto itFreq = freqMap_.find(minFreq_);
+    if (itFreq == freqMap_.end()) {
+      return;
+    }
+    NodeType *victim = itFreq->second->popTail();
+    if (victim) {
+      curTotalFreq_ -= victim->freq;
+      keyMap_.erase(victim->key);
+      if (itFreq->second->empty()) {
+        freqMap_.erase(itFreq);
+      }
+    }
+  }
+
+  void handleOverMaxAvgFreq() noexcept {
     if (keyMap_.empty()) {
       minFreq_ = 0;
       curTotalFreq_ = 0;
       return;
     }
-
-    std::unordered_map<int, FreqListPtr> newFreqMap;
+    std::unordered_map<std::size_t, FreqListPtr> newFreqMap;
     curTotalFreq_ = 0;
-    minFreq_ = INT_MAX;
-
-    for (auto &[key, node] : keyMap_) {
-      int newFreq = std::max(1, node->freq / 2);
-      node->freq = newFreq;
-
+    minFreq_ = std::numeric_limits<std::size_t>::max();
+    for (auto &[k, nodePtr] : keyMap_) {
+      std::size_t newFreq = std::max<std::size_t>(1, nodePtr->freq / 2);
+      nodePtr->freq = newFreq;
       curTotalFreq_ += newFreq;
       minFreq_ = std::min(minFreq_, newFreq);
-
       auto &list = newFreqMap[newFreq];
       if (!list) {
-        list = std::make_unique<FreqList<Key, Value>>();
+        list = std::make_unique<FreqListType>();
       }
-      list->pushFront(node);
+      nodePtr->unlink();
+      list->pushFront(nodePtr.get());
     }
-
     freqMap_ = std::move(newFreqMap);
   }
+  std::size_t capacity_{0};
+  std::size_t maxAvgFreq_{0};
+  std::size_t curTotalFreq_{0};
+  std::size_t minFreq_{0};
 
-  int minFreq_{0};
-  size_t capacity_{0};
-  size_t size_{0};
-  size_t maxAvgFreq_{0};
-  size_t curTotalFreq_{0};
-  std::unordered_map<Key, NodePtr> keyMap_;
-  std::unordered_map<int, FreqListPtr> freqMap_;
   mutable std::mutex mutex_;
+  std::unordered_map<Key, NodePtr> keyMap_;
+  std::unordered_map<std::size_t, FreqListPtr> freqMap_;
 };
 
-// ============================================================================
-// 分片高并发 LFU 缓存（ShardedLfuCache / KHashLfuCache）
-// ============================================================================
+constexpr std::size_t kLfuCacheLineSize = 64;
 template <typename Key, typename Value, typename Hash = std::hash<Key>>
 class ShardedLfuCache : public YsCachePolicy<Key, Value> {
+private:
+  struct alignas(kLfuCacheLineSize) AlignedShard {
+    LfuCache<Key, Value> cache;
+    AlignedShard(std::size_t cap, std::size_t maxAvg) : cache(cap, maxAvg) {}
+  };
+
 public:
-  ShardedLfuCache(size_t capacity, size_t sliceNum = 0, size_t maxAverageNum = 10)
-      : capacity_(capacity) {
-    size_t hw = std::max(1u, std::thread::hardware_concurrency());
-    size_t targetShards = sliceNum > 0 ? sliceNum : hw;
-
-    // 向上取最近的 2 的幂次，便于做快速位与运算 (& (shardCount_ - 1))
-    shardCount_ = 1;
-    while (shardCount_ < targetShards) {
-      shardCount_ <<= 1;
-    }
-
-    size_t sliceSize =
-        static_cast<size_t>(std::ceil(static_cast<double>(capacity_) / shardCount_));
-
-    lfuSliceCaches_.reserve(shardCount_);
-    for (size_t i = 0; i < shardCount_; ++i) {
-      lfuSliceCaches_.emplace_back(
-          std::make_unique<LfuCache<Key, Value>>(sliceSize, maxAverageNum));
+  explicit ShardedLfuCache(std::size_t capacity, std::size_t sliceNum = 0,
+                           std::size_t maxAvgFreq = 10)
+      : capacity_(capacity),
+        sliceNum_(roundUpToPowerOfTwo(
+            sliceNum > 0 ? sliceNum : std::thread::hardware_concurrency())) {
+    shardMask_ = sliceNum_ - 1;
+    std::size_t sliceSize = (capacity_ + sliceNum_ - 1) / sliceNum_;
+    shards_.reserve(sliceNum_);
+    for (std::size_t i = 0; i < sliceNum_; ++i) {
+      shards_.emplace_back(
+          std::make_unique<AlignedShard>(sliceSize, maxAvgFreq));
     }
   }
-
   void put(Key key, Value value) override {
     getShard(key).put(std::move(key), std::move(value));
   }
-
-  std::optional<Value> get(const Key &key) override {
+  [[nodiscard]] std::optional<Value> get(const Key &key) override {
     return getShard(key).get(key);
   }
-
-  bool remove(const Key &key) override {
+  [[nodiscard]] bool remove(const Key &key) override {
     return getShard(key).remove(key);
   }
-
-  void clear() {
-    for (auto &shard : lfuSliceCaches_) {
-      shard->clear();
-    }
+  [[nodiscard]] bool contains(const Key &key) const override {
+    return getShard(key).contains(key);
   }
-
-  // 兼容 kamacache 的 purge 命名习惯
-  void purge() { clear(); }
-
-  size_t size() const {
-    size_t total = 0;
-    for (const auto &shard : lfuSliceCaches_) {
-      total += shard->size();
+  [[nodiscard]] std::size_t size() const override {
+    std::size_t total = 0;
+    for (const auto &shard : shards_) {
+      total += shard->cache.size();
     }
     return total;
   }
-
-  size_t capacity() const {
-    size_t total = 0;
-    for (const auto &shard : lfuSliceCaches_) {
-      total += shard->capacity();
-    }
-    return total;
+  [[nodiscard]] std::size_t capacity() const noexcept override {
+    return capacity_;
   }
-
-  bool empty() const {
-    for (const auto &shard : lfuSliceCaches_) {
-      if (!shard->empty()) {
+  [[nodiscard]] bool empty() const override {
+    for (const auto &shard : shards_) {
+      if (!shard->cache.empty()) {
         return false;
       }
     }
     return true;
   }
+  void clear() override {
+    for (auto &shard : shards_) {
+      shard->cache.clear();
+    }
+  }
+  void purge() { clear(); }
 
 private:
-  size_t capacity_;
-  size_t shardCount_;
-  std::vector<std::unique_ptr<LfuCache<Key, Value>>> lfuSliceCaches_;
-  Hash hashFunc_;
-
-  LfuCache<Key, Value> &getShard(const Key &key) {
-    return *lfuSliceCaches_[hashFunc_(key) & (shardCount_ - 1)];
+  static std::size_t roundUpToPowerOfTwo(std::size_t n) noexcept {
+    if (n <= 1) {
+      return 1;
+    }
+    std::size_t p = 1;
+    while (p < n) {
+      p <<= 1;
+    }
+    return p;
   }
+  LfuCache<Key, Value> &getShard(const Key &key) {
+    std::size_t index = hashFunc_(key) & shardMask_;
+    return shards_[index]->cache;
+  }
+  const LfuCache<Key, Value> &getShard(const Key &key) const {
+    std::size_t index = hashFunc_(key) & shardMask_;
+    return shards_[index]->cache;
+  }
+  std::size_t capacity_;
+  std::size_t sliceNum_;
+  std::size_t shardMask_;
+  Hash hashFunc_{};
+  std::vector<std::unique_ptr<AlignedShard>> shards_;
 };
-
-// 兼容 kamacache 的别名
-template <typename Key, typename Value>
-using KHashLfuCache = ShardedLfuCache<Key, Value>;
-
-template <typename Key, typename Value>
-using HashLfuCache = ShardedLfuCache<Key, Value>;
-
 } // namespace YsCache

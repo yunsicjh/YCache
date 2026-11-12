@@ -11,316 +11,303 @@ namespace YsCache {
 // 标识节点当前归属的链表
 enum class ArcListType { T1, B1, T2, B2 };
 
-template <typename Key, typename Value>
-class ArcCache : public YsCachePolicy<Key, Value> {
-private:
-  // 核心节点模型
-  struct ArcNode {
-    std::optional<Key> key;
-    std::optional<Value> value; // 处于 B1/B2 幽灵队列时置为 nullopt
-    ArcListType type;
-    std::weak_ptr<ArcNode> prev;
-    std::shared_ptr<ArcNode> next;
+struct ArcNodeBase {
+  ArcNodeBase *prev{nullptr};
+  ArcNodeBase *next{nullptr};
 
-    ArcNode() = default;
-    ArcNode(Key k, Value v, ArcListType t)
-        : key(std::move(k)), value(std::move(v)), type(t) {}
-    ArcNode(Key k, ArcListType t) : key(std::move(k)), type(t) {}
-  };
-
-  using NodePtr = std::shared_ptr<ArcNode>;
-
-  class ArcList {
-  public:
-    ArcList() { initializeList(); }
-
-    ~ArcList() {
-      // 迭代断开链表指针，防止深层递归析构导致栈溢出
-      NodePtr cur = dummyHead_;
-      while (cur) {
-        NodePtr next = cur->next;
-        cur->next = nullptr;
-        cur->prev.reset();
-        cur = next;
-      }
-      dummyHead_ = nullptr;
-      dummyTail_ = nullptr;
+  void unlink() noexcept {
+    if (prev) {
+      prev->next = next;
     }
-
-    void pushFront(NodePtr node) {
-      node->next = dummyHead_->next;
-      dummyHead_->next = node;
-      node->next->prev = node;
-      node->prev = dummyHead_;
-      size_++;
+    if (next) {
+      next->prev = prev;
     }
-
-    void removeNode(NodePtr node) {
-      auto prevNode = node->prev.lock();
-      if (prevNode && node->next) {
-        prevNode->next = node->next;
-        node->next->prev = prevNode;
-        node->prev.reset();
-        node->next = nullptr;
-        size_--;
-      }
+    prev = nullptr;
+    next = nullptr;
+  }
+  void insertAfter(ArcNodeBase *target) noexcept {
+    next = target->next;
+    prev = target;
+    if (target->next) {
+      target->next->prev = this;
     }
+    target->next = this;
+  }
+};
 
-    NodePtr popTail() {
-      auto resNode = dummyTail_->prev.lock();
-      if (resNode && resNode != dummyHead_) {
-        removeNode(resNode);
-        return resNode;
-      }
+template <typename Key, typename Value> struct ArcNode : public ArcNodeBase {
+  Key key;
+  std::optional<Value> value;
+  ArcListType type{ArcListType::T1};
+
+  ArcNode(Key k, Value v, ArcListType t)
+      : key(std::move(k)), value(std::move(v)), type(t) {}
+
+  ArcNode(Key k, ArcListType t)
+      : key(std::move(k)), value(std::nullopt), type(t) {}
+};
+
+template <typename Key, typename Value> class ArcList {
+public:
+  using NodeType = ArcNode<Key, Value>;
+
+  ArcList() noexcept {
+    dummyHead_.next = &dummyTail_;
+    dummyTail_.prev = &dummyHead_;
+    dummyHead_.prev = nullptr;
+    dummyTail_.next = nullptr;
+  }
+
+  ArcList(const ArcList &) = delete;
+  ArcList &operator=(const ArcList &) = delete;
+
+  void clear() noexcept {
+    dummyHead_.next = &dummyTail_;
+    dummyTail_.prev = &dummyHead_;
+    dummyHead_.prev = nullptr;
+    dummyTail_.next = nullptr;
+    size_ = 0;
+  }
+
+  [[nodiscard]] bool empty() const noexcept {
+    return dummyHead_.next == &dummyTail_;
+  }
+
+  [[nodiscard]] std::size_t size() const noexcept { return size_; }
+
+  void pushFront(NodeType *node) noexcept {
+    node->insertAfter(&dummyHead_);
+    size_++;
+  }
+
+  void removeNode(NodeType *node) noexcept {
+    node->unlink();
+    size_--;
+  }
+
+  NodeType *popTail() noexcept {
+    if (empty()) {
       return nullptr;
     }
 
-    bool empty() const { return dummyHead_->next == dummyTail_; }
-    size_t size() const { return size_; }
-
-  private:
-    NodePtr dummyHead_;
-    NodePtr dummyTail_;
-    size_t size_{0};
-
-    void initializeList() {
-      dummyHead_ = std::make_shared<ArcNode>();
-      dummyTail_ = std::make_shared<ArcNode>();
-      dummyHead_->next = dummyTail_;
-      dummyTail_->prev = dummyHead_;
-    }
-  };
-
-public:
-  explicit ArcCache(size_t capacity) : capacity_(capacity), p_(0) {
-    t1_ = std::make_unique<ArcList>();
-    b1_ = std::make_unique<ArcList>();
-    t2_ = std::make_unique<ArcList>();
-    b2_ = std::make_unique<ArcList>();
+    auto *tailNode = static_cast<NodeType *>(dummyTail_.prev);
+    tailNode->unlink();
+    size_--;
+    return tailNode;
   }
 
-  // 显式禁用拷贝与移动
+private:
+  ArcNodeBase dummyHead_{};
+  ArcNodeBase dummyTail_{};
+  std::size_t size_{0};
+};
+
+template <typename Key, typename Value>
+class ArcCache : public YsCachePolicy<Key, Value> {
+public:
+  using NodeType = ArcNode<Key, Value>;
+  using NodePtr = std::unique_ptr<NodeType>;
+  using ListType = ArcList<Key, Value>;
+
+  explicit ArcCache(std::size_t capacity) : capacity_(capacity), p_(0) {}
   ArcCache(const ArcCache &) = delete;
   ArcCache &operator=(const ArcCache &) = delete;
   ArcCache(ArcCache &&) = delete;
   ArcCache &operator=(ArcCache &&) = delete;
+  ~ArcCache() override = default;
 
-  ~ArcCache() override { clear(); }
-
-  // 核心对外接口
-  void put(Key key, Value value) override {
-    std::lock_guard<std::mutex> lock(mutex_);
-    if (capacity_ == 0) {
-      return;
-    }
-
-    auto it = cacheMap_.find(key);
-    if (it != cacheMap_.end()) {
-      auto node = it->second;
-
-      // 分支 1：命中真实数据区 (T1 或 T2)，更新值并提升至 T2
-      if (node->type == ArcListType::T1 || node->type == ArcListType::T2) {
-        if (node->type == ArcListType::T1) {
-          t1_->removeNode(node);
-        } else {
-          t2_->removeNode(node);
-        }
-        node->value = std::move(value);
+  [[nodiscard]] std::optional<Value> get(const Key &key) override {
+    std::lock_guard lock(mutex_);
+    if (auto it = cacheMap_.find(key); it != cacheMap_.end()) {
+      NodeType *node = it->second.get();
+      // 仅命中真实缓存区（T1 或 T2）时返回数据，并提拔到 T2
+      if (node->type == ArcListType::T1) {
+        t1_.removeNode(node);
         node->type = ArcListType::T2;
-        t2_->pushFront(node);
-        return;
+        t2_.pushFront(node);
+        return node->value;
+      } else if (node->type == ArcListType::T2) {
+        t2_.removeNode(node);
+        t2_.pushFront(node);
+        return node->value;
       }
-
-      // 分支 2：命中幽灵链表 B1 (扩大最近访问配额 p)
-      if (node->type == ArcListType::B1) {
-        size_t delta =
-            (b1_->size() >= b2_->size()) ? 1 : (b2_->size() / b1_->size());
-        p_ = std::min(capacity_, p_ + std::max<size_t>(1, delta));
-
-        replace(key);
-
-        b1_->removeNode(node);
-        node->value = std::move(value);
-        node->type = ArcListType::T2;
-        t2_->pushFront(node);
-        return;
-      }
-
-      // 分支 3：命中幽灵链表 B2 (缩小 p，倾斜给高频区)
-      if (node->type == ArcListType::B2) {
-        size_t delta =
-            (b2_->size() >= b1_->size()) ? 1 : (b1_->size() / b2_->size());
-        size_t step = std::max<size_t>(1, delta);
-        p_ = (p_ > step) ? (p_ - step) : 0;
-
-        replace(key);
-
-        b2_->removeNode(node);
-        node->value = std::move(value);
-        node->type = ArcListType::T2;
-        t2_->pushFront(node);
-        return;
-      }
-    }
-
-    // 分支 4：完全未命中 (全新 Key)
-    size_t totalL1 = t1_->size() + b1_->size();
-    size_t totalAll = totalL1 + t2_->size() + b2_->size();
-
-    // 1. 严格维持历史幽灵上限与真实存储空间 (遵循 ARC Case IV 规范)
-    if (totalL1 >= capacity_) {
-      if (t1_->size() < capacity_) {
-        auto ghostNode = b1_->popTail();
-        if (ghostNode && ghostNode->key) {
-          cacheMap_.erase(ghostNode->key.value());
-        }
-        replace(key);
-      } else {
-        // T1 已经独占全部物理容量，直接淘汰 T1 尾部，不转入 B1
-        auto victim = t1_->popTail();
-        if (victim && victim->key) {
-          cacheMap_.erase(victim->key.value());
-        }
-      }
-    } else {
-      if (totalAll >= 2 * capacity_) {
-        auto ghostNode = b2_->popTail();
-        if (ghostNode && ghostNode->key) {
-          cacheMap_.erase(ghostNode->key.value());
-        }
-      }
-      if (t1_->size() + t2_->size() >= capacity_) {
-        replace(key);
-      }
-    }
-
-    // 2. 构建全新节点并插入 T1
-    auto newNode =
-        std::make_shared<ArcNode>(key, std::move(value), ArcListType::T1);
-    t1_->pushFront(newNode);
-    cacheMap_[key] = newNode;
-  }
-
-  std::optional<Value> get(const Key &key) override {
-    std::lock_guard<std::mutex> lock(mutex_);
-    auto it = cacheMap_.find(key);
-    if (it == cacheMap_.end()) {
+      // 命中 B1 或 B2 属于幽灵未命中（Ghost Hit），仅记录历史，无实际值
       return std::nullopt;
     }
-    auto node = it->second;
-
-    // 只有命中真实数据区 (T1 或 T2)，才返回数据并提升至 T2
-    if (node->type == ArcListType::T1 || node->type == ArcListType::T2) {
-      if (node->type == ArcListType::T1) {
-        t1_->removeNode(node);
-      } else {
-        t2_->removeNode(node);
-      }
-      node->type = ArcListType::T2;
-      t2_->pushFront(node);
-      return node->value;
-    }
-
-    // 若命中 B1 或 B2，属于幽灵记录（无真实数据），静默返回 nullopt
-    // 待上层回填调用 put 时，再在 put 中完成 p 的调优与节点复活
     return std::nullopt;
   }
 
-  bool remove(const Key &key) override {
-    std::lock_guard<std::mutex> lock(mutex_);
-
-    auto it = cacheMap_.find(key);
-    if (it == cacheMap_.end()) {
-      return false;
+  void put(Key key, Value value) override {
+    if (capacity_ == 0) {
+      return;
     }
-
-    auto node = it->second;
-    bool wasRealData =
-        (node->type == ArcListType::T1 || node->type == ArcListType::T2);
-
-    // 根据所属链表类型精准移除
-    switch (node->type) {
-    case ArcListType::T1:
-      t1_->removeNode(node);
-      break;
-    case ArcListType::T2:
-      t2_->removeNode(node);
-      break;
-    case ArcListType::B1:
-      b1_->removeNode(node);
-      break;
-    case ArcListType::B2:
-      b2_->removeNode(node);
-      break;
+    std::lock_guard lock(mutex_);
+    // 核心优化：利用 try_emplace 单次哈希
+    auto [it, inserted] = cacheMap_.try_emplace(key, nullptr);
+    if (!inserted) {
+      // 键已在元数据中存在（可能在 T1, T2, B1, B2）
+      NodeType *node = it->second.get();
+      // Case 1: 命中 T1 或 T2（真实有效缓存更新）
+      if (node->type == ArcListType::T1 || node->type == ArcListType::T2) {
+        node->value = std::move(value);
+        if (node->type == ArcListType::T1) {
+          t1_.removeNode(node);
+        } else {
+          t2_.removeNode(node);
+        }
+        node->type = ArcListType::T2;
+        t2_.pushFront(node);
+        return;
+      }
+      // Case 2: 命中 B1 幽灵队列（增加 p，偏向近期访问）
+      if (node->type == ArcListType::B1) {
+        std::size_t b1Size = b1_.size();
+        std::size_t b2Size = b2_.size();
+        std::size_t delta = (b1Size >= b2Size) ? 1 : (b2Size / b1Size);
+        p_ = std::min(capacity_, p_ + delta);
+        replace(false);
+        b1_.removeNode(node);
+        node->value = std::move(value); // 填入真实实体
+        node->type = ArcListType::T2;
+        t2_.pushFront(node);
+        return;
+      }
+      // Case 3: 命中 B2 幽灵队列（减少 p，偏向高频访问）
+      if (node->type == ArcListType::B2) {
+        std::size_t b1Size = b1_.size();
+        std::size_t b2Size = b2_.size();
+        std::size_t delta = (b2Size >= b1Size) ? 1 : (b1Size / b2Size);
+        p_ = (p_ > delta) ? (p_ - delta) : 0;
+        replace(true);
+        b2_.removeNode(node);
+        node->value = std::move(value); // 填入真实实体
+        node->type = ArcListType::T2;
+        t2_.pushFront(node);
+        return;
+      }
     }
-
-    // 从全局索引中抹除
-    cacheMap_.erase(it);
-    return wasRealData;
+    // Case 4: 全新键首次进入（完全未命中）
+    std::size_t totalL1 = t1_.size() + b1_.size();
+    std::size_t totalAll = totalL1 + t2_.size() + b2_.size();
+    // 内存元数据超限清理
+    if (totalL1 == capacity_) {
+      if (t1_.size() < capacity_) {
+        auto *victim = b1_.popTail();
+        if (victim) {
+          cacheMap_.erase(victim->key);
+        }
+        replace(false);
+      } else {
+        auto *victim = t1_.popTail();
+        if (victim) {
+          cacheMap_.erase(victim->key);
+        }
+      }
+    } else if (totalL1 < capacity_) {
+      if (totalAll >= 2 * capacity_) {
+        auto *victim = b2_.popTail();
+        if (victim) {
+          cacheMap_.erase(victim->key);
+        }
+      }
+      replace(false);
+    }
+    // 构造新节点并加入 T1（强异常安全保证）
+    try {
+      it->second = std::make_unique<NodeType>(it->first, std::move(value),
+                                              ArcListType::T1);
+    } catch (...) {
+      cacheMap_.erase(it);
+      throw;
+    }
+    t1_.pushFront(it->second.get());
   }
 
-  void clear() {
-    std::lock_guard<std::mutex> lock(mutex_);
+  [[nodiscard]] bool remove(const Key &key) override {
+    std::lock_guard lock(mutex_);
+    if (auto it = cacheMap_.find(key); it != cacheMap_.end()) {
+      NodeType *node = it->second.get();
+      switch (node->type) {
+      case ArcListType::T1:
+        t1_.removeNode(node);
+        break;
+      case ArcListType::B1:
+        b1_.removeNode(node);
+        break;
+      case ArcListType::T2:
+        t2_.removeNode(node);
+        break;
+      case ArcListType::B2:
+        b2_.removeNode(node);
+        break;
+      }
+      cacheMap_.erase(it);
+      return true;
+    }
+    return false;
+  }
+
+  [[nodiscard]] bool contains(const Key &key) const override {
+    std::lock_guard lock(mutex_);
+    if (auto it = cacheMap_.find(key); it != cacheMap_.end()) {
+      // 只有在 T1 或 T2 中才算真正存在可读数据
+      return it->second->type == ArcListType::T1 ||
+             it->second->type == ArcListType::T2;
+    }
+    return false;
+  }
+  // 真实有效缓存大小（不包含幽灵元数据）
+  [[nodiscard]] std::size_t size() const override {
+    std::lock_guard lock(mutex_);
+    return t1_.size() + t2_.size();
+  }
+  [[nodiscard]] std::size_t capacity() const noexcept override {
+    return capacity_;
+  }
+  [[nodiscard]] bool empty() const override {
+    std::lock_guard lock(mutex_);
+    return (t1_.size() + t2_.size()) == 0;
+  }
+  void clear() override {
+    std::lock_guard lock(mutex_);
     cacheMap_.clear();
-    t1_ = std::make_unique<ArcList>();
-    b1_ = std::make_unique<ArcList>();
-    t2_ = std::make_unique<ArcList>();
-    b2_ = std::make_unique<ArcList>();
+    t1_.clear();
+    b1_.clear();
+    t2_.clear();
+    b2_.clear();
     p_ = 0;
   }
 
-  // 获取真实物理缓存数据量 (|T1| + |T2|)
-  size_t size() const {
-    std::lock_guard<std::mutex> lock(mutex_);
-    return t1_->size() + t2_->size();
-  }
-
-  size_t capacity() const noexcept { return capacity_; }
-
-  bool empty() const {
-    std::lock_guard<std::mutex> lock(mutex_);
-    return (t1_->size() + t2_->size()) == 0;
-  }
-
 private:
-  void replace(const Key &key) {
-    // 1. 判定 key 当前是否处于 B2 中
-    auto it = cacheMap_.find(key);
-    bool inB2 = (it != cacheMap_.end() && it->second->type == ArcListType::B2);
-
-    // 2. 判定淘汰源：T1 非空，且满足 (T1 超过配额) 或 (刚好等于配额且 key 在 B2 中)
-    if (!t1_->empty() && (t1_->size() > p_ || (inB2 && t1_->size() == p_))) {
-      // 从 T1 尾部淘汰
-      auto node = t1_->popTail();
-      if (node) {
-        // 清空 Value 释放内存，降级为 B1 幽灵节点
-        node->value.reset();
-        node->type = ArcListType::B1;
-        b1_->pushFront(node);
+  void replace(bool inB2 = false) noexcept {
+    std::size_t t1Size = t1_.size();
+    if (t1Size > 0 && ((t1Size > p_) || (inB2 && t1Size == p_))) {
+      // 从 T1 淘汰尾部至 B1（释放 Value 内存，就地变身为幽灵节点）
+      auto *victim = t1_.popTail();
+      if (victim) {
+        victim->value.reset(); // 零堆重新分配，就地释放内存！
+        victim->type = ArcListType::B1;
+        b1_.pushFront(victim);
       }
     } else {
-      // 从 T2 尾部淘汰
-      auto node = t2_->popTail();
-      if (node) {
-        // 清空 Value 释放内存，降级为 B2 幽灵节点
-        node->value.reset();
-        node->type = ArcListType::B2;
-        b2_->pushFront(node);
+      // 从 T2 淘汰尾部至 B2（释放 Value 内存，就地变身为幽灵节点）
+      auto *victim = t2_.popTail();
+      if (victim) {
+        victim->value.reset(); // 零堆重新分配，就地释放内存！
+        victim->type = ArcListType::B2;
+        b2_.pushFront(victim);
       }
     }
   }
+  std::size_t capacity_{0};
+  std::size_t p_{0};
 
-  size_t capacity_{0}; // 物理缓存总容量 c
-  size_t p_{0};        // 目标配额边界 p
-
-  // 四大链表
-  std::unique_ptr<ArcList> t1_;
-  std::unique_ptr<ArcList> b1_;
-  std::unique_ptr<ArcList> t2_;
-  std::unique_ptr<ArcList> b2_;
-
-  std::unordered_map<Key, NodePtr> cacheMap_; // 全局索引
   mutable std::mutex mutex_;
-};
+  std::unordered_map<Key, NodePtr> cacheMap_;
 
+  ListType t1_{};
+  ListType b1_{};
+  ListType t2_{};
+  ListType b2_{};
+};
 } // namespace YsCache
