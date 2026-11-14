@@ -85,9 +85,12 @@ public:
   using NodePtr = std::unique_ptr<NodeType>;
   using FreqListType = FreqList<Key, Value>;
   using FreqListPtr = std::unique_ptr<FreqListType>;
+  using EvictionCallback = typename YsCachePolicy<Key, Value>::EvictionCallback;
 
-  explicit LfuCache(std::size_t capacity, std::size_t maxAvgFreq = 10)
-      : capacity_(capacity), maxAvgFreq_(maxAvgFreq) {}
+  explicit LfuCache(std::size_t capacity, std::size_t maxAvgFreq = 10,
+                    EvictionCallback onEvict = nullptr)
+      : capacity_(capacity), maxAvgFreq_(maxAvgFreq),
+        evictionCallback_(std::move(onEvict)) {}
 
   LfuCache(const LfuCache &) = delete;
   LfuCache &operator=(const LfuCache &) = delete;
@@ -160,6 +163,11 @@ public:
     return false;
   }
 
+  void setEvictionCallback(EvictionCallback cb) override {
+    std::lock_guard lock(mutex_);
+    evictionCallback_ = std::move(cb);
+  }
+
   [[nodiscard]] bool contains(const Key &key) const override {
     std::lock_guard lock(mutex_);
     return keyMap_.find(key) != keyMap_.end();
@@ -190,6 +198,7 @@ private:
     node->freq = newFreq;
 
     node->unlink();
+
     if (auto itOld = freqMap_.find(oldFreq);
         itOld != freqMap_.end() && itOld->second->empty()) {
       freqMap_.erase(itOld);
@@ -219,6 +228,13 @@ private:
     NodeType *victim = itFreq->second->popTail();
     if (victim) {
       curTotalFreq_ -= victim->freq;
+      if (evictionCallback_) {
+        try {
+          evictionCallback_(victim->key, victim->value);
+        } catch (...) {
+          // 忽略回调异常，确保缓存继续运行
+        }
+      }
       keyMap_.erase(victim->key);
       if (itFreq->second->empty()) {
         freqMap_.erase(itFreq);
@@ -257,6 +273,8 @@ private:
   mutable std::mutex mutex_;
   std::unordered_map<Key, NodePtr> keyMap_;
   std::unordered_map<std::size_t, FreqListPtr> freqMap_;
+
+  EvictionCallback evictionCallback_;
 };
 
 constexpr std::size_t kLfuCacheLineSize = 64;
@@ -269,6 +287,7 @@ private:
   };
 
 public:
+  using EvictionCallback = typename YsCachePolicy<Key, Value>::EvictionCallback;
   explicit ShardedLfuCache(std::size_t capacity, std::size_t sliceNum = 0,
                            std::size_t maxAvgFreq = 10)
       : capacity_(capacity),
@@ -290,6 +309,12 @@ public:
   }
   [[nodiscard]] bool remove(const Key &key) override {
     return getShard(key).remove(key);
+  }
+
+  void setEvictionCallback(EvictionCallback cb) override {
+    for (auto &shard : shards_) {
+      shard->cache.setEvictionCallback(cb);
+    }
   }
   [[nodiscard]] bool contains(const Key &key) const override {
     return getShard(key).contains(key);

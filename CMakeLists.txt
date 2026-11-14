@@ -49,3 +49,9 @@ if(YS_BUILD_TESTS AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/CMakeLists.txt")
     enable_testing()
     add_subdirectory(tests)
 endif()
+
+# 7. 引入基准测试目录（构建 Google Benchmark 性能评测）
+option(YS_BUILD_BENCHMARKS "Build Google Benchmark performance suites" ON)
+if(YS_BUILD_BENCHMARKS AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/benchmarks/CMakeLists.txt")
+    add_subdirectory(benchmarks)
+endif()

@@ -1,8 +1,8 @@
 #pragma once
 
 #include <cstddef>
+#include <functional>
 #include <optional>
-
 namespace YsCache {
 
 /**
@@ -13,13 +13,14 @@ namespace YsCache {
  * 工业级设计原则：
  * 1. 纯虚接口定义最小正交集合（Orthogonal Interface）；
  * 2. 入参采用 Sink Argument 传值模式，对右值提供零多余拷贝支持；
- * 3. 查询与状态判断接口标有 [[nodiscard]]，防止逻辑误用（如误把 empty() 当作 clear()）；
+ * 3. 查询与状态判断接口标有 [[nodiscard]]，防止逻辑误用（如误把 empty() 当作
+ * clear()）；
  * 4. 读操作全量具备 const 规范，内部并发安全由派生类的 mutable 同步原语支撑；
  * 5. 严格区分宽契约与强 noexcept 边界，为多线程锁和自定义类型留出安全弹性。
  */
-template <typename Key, typename Value>
-class YsCachePolicy {
+template <typename Key, typename Value> class YsCachePolicy {
 public:
+  using EvictionCallback = std::function<void(const Key &, const Value &)>;
   virtual ~YsCachePolicy() = default;
 
   // ---------------- 核心读写接口 ----------------
@@ -44,7 +45,14 @@ public:
    * @return 存在并移除成功返回 true，键不存在返回 false
    */
   [[nodiscard]] virtual bool remove(const Key &key) = 0;
-
+  // ---------------- 观察者模式监听接口 ----------------
+  /**
+   * @brief 注册淘汰监听器（观察者）
+   * @param cb 监听回调函数
+   */
+  virtual void setEvictionCallback(EvictionCallback cb) {
+    (void)cb; // 默认空实现
+  }
   // ---------------- 基础状态与运维查询接口 ----------------
 
   /**

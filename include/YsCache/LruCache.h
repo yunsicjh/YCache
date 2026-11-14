@@ -70,8 +70,10 @@ public:
   using NodeType = LruNode<Key, Value>;
   using NodePtr = std::unique_ptr<NodeType>;
   using NodeMap = std::unordered_map<Key, NodePtr>;
+  using EvictionCallback = typename YsCachePolicy<Key, Value>::EvictionCallback;
 
-  explicit LruCache(std::size_t capacity) : capacity_(capacity) {
+  explicit LruCache(std::size_t capacity, EvictionCallback onEvict = nullptr)
+      : capacity_(capacity), evictionCallback_(std::move(onEvict)) {
     initializeList();
   }
 
@@ -127,6 +129,11 @@ public:
     }
     return false;
   }
+
+  void setEvictionCallback(EvictionCallback cb) override {
+    std::lock_guard lock(mutex_);
+    evictionCallback_ = std::move(cb);
+  }
   [[nodiscard]] virtual bool contains(const Key &key) const override {
     std::lock_guard lock(mutex_);
     return cacheMap_.find(key) != cacheMap_.end();
@@ -170,6 +177,14 @@ private:
     }
     auto *victim = static_cast<NodeType *>(dummyTail_.prev);
     victim->unlink();
+
+    if (evictionCallback_) {
+      try {
+        evictionCallback_(victim->key, victim->value);
+      } catch (...) {
+        // 忽略回调异常，确保缓存继续运行
+      }
+    }
     cacheMap_.erase(victim->key);
   }
   std::size_t capacity_;
@@ -177,6 +192,8 @@ private:
   NodeMap cacheMap_;
   LruNodeBase dummyHead_;
   LruNodeBase dummyTail_;
+
+  EvictionCallback evictionCallback_;
 };
 
 constexpr std::size_t KCacheLineSize = 64; // 缓存行大小
@@ -191,6 +208,7 @@ private:
   };
 
 public:
+  using EvictionCallback = typename YsCachePolicy<Key, Value>::EvictionCallback;
   explicit ShardedLruCache(std::size_t capacity, std::size_t shardCount = 0)
       : capacity_(capacity),
         shardCount_(roundUpToPowerOfTwo(
@@ -213,6 +231,12 @@ public:
 
   [[nodiscard]] bool remove(const Key &key) override {
     return getShard(key).remove(key);
+  }
+
+  void setEvictionCallback(EvictionCallback cb) override {
+    for (auto &shard : shards_) {
+      shard->cache.setEvictionCallback(cb);
+    }
   }
 
   [[nodiscard]] bool contains(const Key &key) const override {
@@ -291,9 +315,12 @@ private:
   using NodeMap = std::unordered_map<Key, NodePtr>;
 
 public:
+  using EvictionCallback = typename YsCachePolicy<Key, Value>::EvictionCallback;
+
   explicit LruKCache(std::size_t capacity, std::size_t historyCapacity,
-                     std::size_t k = 2)
-      : k_(k), kCapacity_(capacity), historyCapacity_(historyCapacity) {
+                     std::size_t k = 2, EvictionCallback onEvict = nullptr)
+      : k_(k), kCapacity_(capacity), historyCapacity_(historyCapacity),
+        evictionCallback_(std::move(onEvict)) {
     initializeLists();
   }
 
@@ -411,6 +438,11 @@ public:
     return false;
   }
 
+  void setEvictionCallback(EvictionCallback cb) override {
+    std::lock_guard lock(mutex_);
+    evictionCallback_ = std::move(cb);
+  }
+
   [[nodiscard]] bool contains(const Key &key) const override {
     std::lock_guard lock(mutex_);
     return cacheMap_.find(key) != cacheMap_.end();
@@ -459,6 +491,12 @@ private:
     auto *victim = static_cast<LruKNode *>(mainTail_.prev);
     victim->unlink();
     mainSize_--;
+    if (evictionCallback_) {
+      try {
+        evictionCallback_(victim->key, victim->value);
+      } catch (...) {
+      }
+    }
     cacheMap_.erase(victim->key);
   }
 
@@ -470,6 +508,12 @@ private:
     auto *victim = static_cast<LruKNode *>(historyTail_.prev);
     victim->unlink();
     historySize_--;
+    if (evictionCallback_) {
+      try {
+        evictionCallback_(victim->key, victim->value);
+      } catch (...) {
+      }
+    }
     cacheMap_.erase(victim->key);
   }
   std::size_t k_;
@@ -485,6 +529,8 @@ private:
   LruNodeBase mainTail_{};
   LruNodeBase historyHead_{};
   LruNodeBase historyTail_{};
+
+  EvictionCallback evictionCallback_{nullptr};
 };
 
 } // namespace YsCache

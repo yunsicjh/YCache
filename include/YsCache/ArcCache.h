@@ -109,7 +109,10 @@ public:
   using NodePtr = std::unique_ptr<NodeType>;
   using ListType = ArcList<Key, Value>;
 
-  explicit ArcCache(std::size_t capacity) : capacity_(capacity), p_(0) {}
+  using EvictionCallback = typename YsCachePolicy<Key, Value>::EvictionCallback;
+
+  explicit ArcCache(std::size_t capacity, EvictionCallback onEvict = nullptr)
+      : capacity_(capacity), p_(0), evictionCallback_(std::move(onEvict)) {}
   ArcCache(const ArcCache &) = delete;
   ArcCache &operator=(const ArcCache &) = delete;
   ArcCache(ArcCache &&) = delete;
@@ -204,13 +207,15 @@ public:
         }
       }
     } else if (totalL1 < capacity_) {
-      if (totalAll >= 2 * capacity_) {
-        auto *victim = b2_.popTail();
-        if (victim) {
-          cacheMap_.erase(victim->key);
+      if (totalAll >= capacity_) {
+        if (totalAll >= 2 * capacity_) {
+          auto *victim = b2_.popTail();
+          if (victim) {
+            cacheMap_.erase(victim->key);
+          }
         }
+        replace(false);
       }
-      replace(false);
     }
     // 构造新节点并加入 T1（强异常安全保证）
     try {
@@ -246,7 +251,10 @@ public:
     }
     return false;
   }
-
+  void setEvictionCallback(EvictionCallback cb) override {
+    std::lock_guard lock(mutex_);
+    evictionCallback_ = std::move(cb);
+  }
   [[nodiscard]] bool contains(const Key &key) const override {
     std::lock_guard lock(mutex_);
     if (auto it = cacheMap_.find(key); it != cacheMap_.end()) {
@@ -285,6 +293,13 @@ private:
       // 从 T1 淘汰尾部至 B1（释放 Value 内存，就地变身为幽灵节点）
       auto *victim = t1_.popTail();
       if (victim) {
+        if (evictionCallback_) {
+          try {
+            if (victim->value) evictionCallback_(victim->key, *victim->value);
+          } catch (...) {
+            // 忽略回调异常，确保缓存继续运行
+          }
+        }
         victim->value.reset(); // 零堆重新分配，就地释放内存！
         victim->type = ArcListType::B1;
         b1_.pushFront(victim);
@@ -293,6 +308,13 @@ private:
       // 从 T2 淘汰尾部至 B2（释放 Value 内存，就地变身为幽灵节点）
       auto *victim = t2_.popTail();
       if (victim) {
+        if (evictionCallback_) {
+          try {
+            if (victim->value) evictionCallback_(victim->key, *victim->value);
+          } catch (...) {
+            // 忽略回调异常，确保缓存继续运行
+          }
+        }
         victim->value.reset(); // 零堆重新分配，就地释放内存！
         victim->type = ArcListType::B2;
         b2_.pushFront(victim);
@@ -309,5 +331,7 @@ private:
   ListType b1_{};
   ListType t2_{};
   ListType b2_{};
+
+  EvictionCallback evictionCallback_{nullptr};
 };
 } // namespace YsCache
