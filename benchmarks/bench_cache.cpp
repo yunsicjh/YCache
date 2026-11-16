@@ -3,6 +3,7 @@
 #include "YsCache/LfuCache.h"
 #include "YsCache/LruCache.h"
 #include "YsCache/MetricsCacheDecorator.h"
+#include "YsCache/PolicyCache.h"
 #include "YsCache/TtlCacheDecorator.h"
 
 #include <benchmark/benchmark.h>
@@ -173,6 +174,34 @@ static void BM_Decorator_WithTtl(benchmark::State &state) {
 }
 BENCHMARK(BM_Decorator_WithTtl);
 
+static void BM_StaticDecorator_WithMetrics(benchmark::State &state) {
+  StaticMetricsDecorator<FastLruCache<int, int>> cache(1000);
+  for (int i = 0; i < 1000; ++i) {
+    cache.put(i, i);
+  }
+  int key = 0;
+  for (auto _ : state) {
+    auto val = cache.get(key++ % 1000);
+    benchmark::DoNotOptimize(val);
+  }
+  state.SetItemsProcessed(state.iterations());
+}
+BENCHMARK(BM_StaticDecorator_WithMetrics);
+
+static void BM_StaticDecorator_WithTtl(benchmark::State &state) {
+  StaticTtlDecorator<int, int, FastLruCache> cache(std::chrono::hours(1), 1000);
+  for (int i = 0; i < 1000; ++i) {
+    cache.put(i, i);
+  }
+  int key = 0;
+  for (auto _ : state) {
+    auto val = cache.get(key++ % 1000);
+    benchmark::DoNotOptimize(val);
+  }
+  state.SetItemsProcessed(state.iterations());
+}
+BENCHMARK(BM_StaticDecorator_WithTtl);
+
 // ============================================================================
 // 3. 多核高并发伪共享消抖对比 (Global Lock vs Sharded alignas(64))
 // ============================================================================
@@ -244,5 +273,115 @@ BENCHMARK(BM_Concurrent_Sharded_Lru)
     ->Threads(4)
     ->Threads(8)
     ->UseRealTime();
+
+// ============================================================================
+// 4. 动态虚表多态 vs 编译期零成本策略对比 (Dynamic vs Static Zero-Cost)
+// ============================================================================
+
+static void BM_Dynamic_Lru_Virtual_Get(benchmark::State &state) {
+  constexpr std::size_t kCapacity = 10000;
+  std::unique_ptr<YsCachePolicy<int, int>> cache =
+      std::make_unique<LruCache<int, int>>(kCapacity);
+  for (std::size_t i = 0; i < kCapacity; ++i) {
+    cache->put(static_cast<int>(i), static_cast<int>(i));
+  }
+  int key = 0;
+  for (auto _ : state) {
+    auto val = cache->get(key++ % kCapacity);
+    benchmark::DoNotOptimize(val);
+  }
+  state.SetItemsProcessed(state.iterations());
+}
+BENCHMARK(BM_Dynamic_Lru_Virtual_Get);
+
+static void BM_Policy_FastLru_Static_Get(benchmark::State &state) {
+  constexpr std::size_t kCapacity = 10000;
+  FastLruCache<int, int> cache(kCapacity);
+  for (std::size_t i = 0; i < kCapacity; ++i) {
+    cache.put(static_cast<int>(i), static_cast<int>(i));
+  }
+  int key = 0;
+  for (auto _ : state) {
+    auto val = cache.get(key++ % kCapacity);
+    benchmark::DoNotOptimize(val);
+  }
+  state.SetItemsProcessed(state.iterations());
+}
+BENCHMARK(BM_Policy_FastLru_Static_Get);
+
+static void BM_Policy_FastFifo_Static_Get(benchmark::State &state) {
+  constexpr std::size_t kCapacity = 10000;
+  FastFifoCache<int, int> cache(kCapacity);
+  for (std::size_t i = 0; i < kCapacity; ++i) {
+    cache.put(static_cast<int>(i), static_cast<int>(i));
+  }
+  int key = 0;
+  for (auto _ : state) {
+    auto val = cache.get(key++ % kCapacity);
+    benchmark::DoNotOptimize(val);
+  }
+  state.SetItemsProcessed(state.iterations());
+}
+BENCHMARK(BM_Policy_FastFifo_Static_Get);
+
+static void BM_Dynamic_Arc_Virtual_Get(benchmark::State &state) {
+  constexpr std::size_t kCapacity = 10000;
+  std::unique_ptr<YsCachePolicy<int, int>> cache =
+      std::make_unique<ArcCache<int, int>>(kCapacity);
+  for (std::size_t i = 0; i < kCapacity; ++i) {
+    cache->put(static_cast<int>(i), static_cast<int>(i));
+  }
+  int key = 0;
+  for (auto _ : state) {
+    auto val = cache->get(key++ % kCapacity);
+    benchmark::DoNotOptimize(val);
+  }
+  state.SetItemsProcessed(state.iterations());
+}
+BENCHMARK(BM_Dynamic_Arc_Virtual_Get);
+
+static void BM_Policy_FastArc_Static_Get(benchmark::State &state) {
+  constexpr std::size_t kCapacity = 10000;
+  FastArcCache<int, int> cache(kCapacity);
+  for (std::size_t i = 0; i < kCapacity; ++i) {
+    cache.put(static_cast<int>(i), static_cast<int>(i));
+  }
+  int key = 0;
+  for (auto _ : state) {
+    auto val = cache.get(key++ % kCapacity);
+    benchmark::DoNotOptimize(val);
+  }
+  state.SetItemsProcessed(state.iterations());
+}
+BENCHMARK(BM_Policy_FastArc_Static_Get);
+
+static void BM_Dynamic_Arc_Virtual_Put_Evict(benchmark::State &state) {
+  constexpr std::size_t kCapacity = 5000;
+  std::unique_ptr<YsCachePolicy<int, int>> cache =
+      std::make_unique<ArcCache<int, int>>(kCapacity);
+  for (std::size_t i = 0; i < kCapacity; ++i) {
+    cache->put(static_cast<int>(i), static_cast<int>(i));
+  }
+  int key = static_cast<int>(kCapacity);
+  for (auto _ : state) {
+    cache->put(key++, 12345);
+  }
+  state.SetItemsProcessed(state.iterations());
+}
+BENCHMARK(BM_Dynamic_Arc_Virtual_Put_Evict);
+
+static void BM_Policy_FastArc_Static_Put_Evict(benchmark::State &state) {
+  constexpr std::size_t kCapacity = 5000;
+  FastArcCache<int, int> cache(kCapacity);
+  for (std::size_t i = 0; i < kCapacity; ++i) {
+    cache.put(static_cast<int>(i), static_cast<int>(i));
+  }
+  int key = static_cast<int>(kCapacity);
+  for (auto _ : state) {
+    cache.put(key++, 12345);
+  }
+  state.SetItemsProcessed(state.iterations());
+}
+BENCHMARK(BM_Policy_FastArc_Static_Put_Evict);
 
 BENCHMARK_MAIN();

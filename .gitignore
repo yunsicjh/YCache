@@ -1,7 +1,5 @@
-/docs
-/tests
 /third_party
-
+.vscode
 # Operating system files
 # macOS
 .DS_Store

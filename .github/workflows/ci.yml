@@ -1,0 +1,98 @@
+name: YsCache CI
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-and-test:
+    name: ${{ matrix.os }} · ${{ matrix.compiler }} · ${{ matrix.build_type }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # 1. Linux GCC-12 - Release 生产级性能构建
+          - os: ubuntu-22.04
+            compiler: gcc-12
+            c_compiler: gcc-12
+            cpp_compiler: g++-12
+            build_type: Release
+            build_benchmarks: ON
+
+          # 2. Linux GCC-12 - Debug 调试模式（断言与调试信息）
+          - os: ubuntu-22.04
+            compiler: gcc-12
+            c_compiler: gcc-12
+            cpp_compiler: g++-12
+            build_type: Debug
+            build_benchmarks: OFF
+
+          # 3. Linux Clang-15 - Release 跨编译器检验
+          - os: ubuntu-22.04
+            compiler: clang-15
+            c_compiler: clang-15
+            cpp_compiler: clang++-15
+            build_type: Release
+            build_benchmarks: ON
+
+          # 4. macOS 14 (Apple Silicon M-series ARM64) - Release
+          - os: macos-14
+            compiler: appleclang
+            c_compiler: clang
+            cpp_compiler: clang++
+            build_type: Release
+            build_benchmarks: ON
+
+          # 5. macOS 13 (Intel x86_64) - Release
+          - os: macos-13
+            compiler: appleclang
+            c_compiler: clang
+            cpp_compiler: clang++
+            build_type: Release
+            build_benchmarks: ON
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install dependencies (Ubuntu)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build ${{ matrix.c_compiler }} ${{ matrix.cpp_compiler }}
+
+      - name: Install dependencies (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          brew install ninja
+
+      - name: Configure CMake
+        run: |
+          cmake -B build -G "Ninja" \
+            -DCMAKE_BUILD_TYPE=${{ matrix.build_type }} \
+            -DCMAKE_C_COMPILER=${{ matrix.c_compiler }} \
+            -DCMAKE_CXX_COMPILER=${{ matrix.cpp_compiler }} \
+            -DYS_BUILD_TESTS=ON \
+            -DYS_BUILD_EXAMPLES=ON \
+            -DYS_BUILD_BENCHMARKS=${{ matrix.build_benchmarks }}
+
+      - name: Build
+        run: |
+          cmake --build build --config ${{ matrix.build_type }} -j
+
+      - name: Run Unit Tests (CTest)
+        run: |
+          ctest --test-dir build --output-on-failure --timeout 60
+
+      - name: Run Benchmark Smoke Test
+        if: matrix.build_benchmarks == 'ON' && matrix.build_type == 'Release'
+        run: |
+          ./build/benchmarks/bench_cache --benchmark_filter="BM_Policy_Fast.*" --benchmark_min_time=0.05s
